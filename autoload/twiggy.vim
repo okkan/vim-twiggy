@@ -144,6 +144,10 @@ function! s:gitize(cmd) abort
   else
     let git_cmd = fugitive#repo().git_command()
   end
+  let parts = split(git_cmd, " ")
+  let worktree = "--work-tree=".s:sub(split(parts[1], "=")[1], '\v/.git$', "/")
+  call insert(parts, worktree, 1)
+  let git_cmd = join(parts, " ")
   return git_cmd . ' ' . a:cmd
 endfunction
 
@@ -161,7 +165,20 @@ endfunction
 "   {{{2 call
 function! s:call(mapping) abort
   let key = s:encode_mapping(a:mapping)
-  echom type(key)
+  let deprecated_mappings = {
+        \ 'F': 'f',
+        \ '^': 'P',
+        \ 'g^': 'gP',
+        \ '!^': '!P',
+        \ 'V': 'p',
+        \ 'd^': 'dP'
+        \ }
+  let encoded_mapping = s:encode_mapping(a:mapping)
+  if has_key(deprecated_mappings, encoded_mapping)
+    let t:twiggy_deprecation_notice = "WARNING: `".a:mapping
+          \ ."` is deprecated and will eventually be removed.  "
+          \ ."Use `".deprecated_mappings[encoded_mapping]."` instead."
+  endif
   if call('s:' . s:mappings[key][0], s:mappings[key][1])
     call s:ErrorMsg()
   else
@@ -182,7 +199,9 @@ endfunction
 function! s:parse_branch(branch, type) abort
   let branch = {}
 
-  let branch.current = match(a:branch, '\v^\*') >= 0
+  let pieces = split(a:branch, "\t\t")
+
+  let branch.current = pieces[0] ==# "*"
 
   let branch.decoration = ' '
   if branch.current
@@ -190,17 +209,14 @@ function! s:parse_branch(branch, type) abort
     let branch.decoration = git_mode !=# 'normal' ? s:icons.unmerged : s:icons.current
   endif
 
-  " let detached = match(a:branch, '\v^*\ \((\w+ )?detached at \w+\/[a-zA-Z]+\)')
-  let detached = a:branch[2:6] ==# "(HEAD"
-
-  let remote_details = matchstr(a:branch, '\v\[[^\[]+\]')
+  let remote_details = pieces[3] . ' ' . pieces[4]
   let branch.tracking = ''
-  if a:type ==# 'list'
-    let branch.tracking = matchstr(remote_details, '\v[^ \:\]]+', 1)
+  if a:type ==# 'heads'
+    let branch.tracking = pieces[3]
   endif
   let branch.remote =  branch.tracking != '' ? split(branch.tracking, '/')[0] : ''
   if branch.tracking !=# ''
-    if match(remote_details, '\vahead [0-9]+\, behind [0-9]') >= 0
+    if pieces[4] !=# ''
       let branch.status      = 'both'
       let branch.decoration .= s:icons.both
     elseif match(remote_details, '\vahead [0-9]') >= 0
@@ -213,22 +229,14 @@ function! s:parse_branch(branch, type) abort
       let branch.status      = ''
       let branch.decoration .= s:icons.tracking
     endif
-  elseif detached
-    let branch.status      = 'detached'
-    let branch.decoration .= s:icons.detached
   else
     let branch.status      = ''
     let branch.decoration .= ' '
   endif
 
-  if detached
-    echom matchstr(a:branch, '\v[(.*?)]', 2)
-    let branch.fullname = 'HEAD:' . s:sub(matchstr(a:branch, '\v[^()]+', 2), "HEAD detached at ", '')
-  else
-    let branch.fullname = matchstr(a:branch, '\v(\([^\)]+\)|^[^ ]+)', 2)
-  endif
+  let branch.fullname = pieces[1]
 
-  if a:type == 'list'
+  if a:type == 'heads'
     let branch.is_local = 1
     let branch.type  = 'local'
     if g:twiggy_group_locals_by_slash
@@ -244,9 +252,6 @@ function! s:parse_branch(branch, type) abort
       let branch.group = 'local'
       let branch.name = branch.fullname
     endif
-    if detached
-      let branch.name = s:sub(s:sub(branch.name, '\(detached from ', ''), '\)', '')
-    endif
   else
     let branch.is_local = 0
     let branch.type = 'remote'
@@ -255,7 +260,17 @@ function! s:parse_branch(branch, type) abort
     let branch.group = branch_split[0]
   endif
 
-  let branch.details = s:sub(a:branch,  '[* ] [0-9A-Za-z_/\-]+[ ]+', '')
+  let remote_details = pieces[3]
+  if pieces[4] !=# ''
+    let remote_details = remote_details . ': ' . pieces[4][1:-2]
+  endif
+
+  if remote_details ==# ''
+    let branch.details = join([pieces[2], pieces[5]], ' ')
+  else
+    let remote_details = '['.remote_details.']'
+    let branch.details = join([pieces[2], remote_details, pieces[5]], ' ')
+  endif
 
   return branch
 endfunction
@@ -274,7 +289,15 @@ endfunction
 "   {{{2 _git_branch_vv
 function! s:_git_branch_vv(type) abort
   let branches = []
-  for branch in s:git_cmd('branch --' . a:type . ' -vv --no-color', 0)
+  let format = join([
+        \ '%(HEAD)',
+        \ '%(refname:short)',
+        \ '%(objectname:short)',
+        \ '%(upstream:short)',
+        \ '%(upstream:track)',
+        \ '%(contents:subject)',
+        \ ], "\t\t")
+  for branch in s:git_cmd('for-each-ref refs/' . a:type . " --format=$'".format."'", 0)
     call add(branches, s:parse_branch(branch, a:type))
   endfor
 
@@ -299,8 +322,25 @@ endfunction
 
 "   {{{2 get_branches
 function! twiggy#get_branches() abort
-  let locals = s:_git_branch_vv('list')
+  let locals = s:_git_branch_vv('heads')
   let locals_sorted = []
+
+    let head = s:git_cmd('rev-parse --symbolic-full-name --abbrev-ref HEAD', 0)[0]
+    if head ==# "HEAD"
+      call add(locals_sorted, {
+            \ 'decoration': s:icons['detached'].' ',
+            \ 'status': 'detached',
+            \ 'fullname': 'HEAD',
+            \ 'name': 'HEAD@'.s:git_cmd('rev-parse --revs-only --short HEAD', 0)[0],
+            \ 'is_local': 1,
+            \ 'current': 0,
+            \ 'remote': s:git_cmd('remote', 0)[0],
+            \ 'type': 'local',
+            \ 'tracking': '',
+            \ 'details': 'detached',
+            \ 'group': 'local'
+            \  })
+    endif
 
   let reflog = s:get_uniq_branch_names_from_reflog()
   let s:branches_not_in_reflog = []
@@ -363,7 +403,7 @@ function! twiggy#get_branches() abort
 
   let locals = extend(locals_sorted, locals)
 
-  let remotes = s:_git_branch_vv('remote')
+  let remotes = s:_git_branch_vv('remotes')
   let remotes_sorted = []
 
   if g:twiggy_remote_branch_sort ==# 'date'
@@ -405,6 +445,15 @@ function! s:branch_under_cursor() abort
     return s:branch_line_refs[line]
   endif
   return ''
+endfunction
+
+" Note: this may change
+function! TwiggyBranchUnderCursor() abort
+  if &ft !=# 'twiggy'
+    throw "Not in twiggy buffer"
+  endif
+
+  return s:branch_under_cursor()
 endfunction
 
 "   {{{2 get_uniq_branch_names_from_reflog
@@ -547,17 +596,19 @@ function! s:quickhelp_view() abort
   call add(output, '<CR>  checkout')
   call add(output, 'C     checkout remote')
   call add(output, 'O     checkout remote')
-  call add(output, 'F     fetch remote')
+  call add(output, 'gc    checkout as: <name>')
+  call add(output, 'go    checkout as: <name>')
+  call add(output, 'f     fetch remote')
   call add(output, 'm     merge')
   call add(output, 'M     merge remote')
   call add(output, 'gm    `m` --no-ff')
   call add(output, 'gM    `M` --no-ff')
   call add(output, 'r     rebase')
   call add(output, 'R     rebase remote')
-  call add(output, '^     push')
-  call add(output, 'g^    push (prompted)')
-  call add(output, '!^    force push')
-  call add(output, 'V     pull')
+  call add(output, 'P     push')
+  call add(output, 'gP    push (prompted)')
+  call add(output, '!P    force push')
+  call add(output, 'p     pull')
   if g:twiggy_git_log_command !=# ''
     call add(output, 'gl    git log')
     call add(output, 'gL    git log `..`')
@@ -565,8 +616,9 @@ function! s:quickhelp_view() abort
   call add(output, ',     rename')
   call add(output, 'dd    delete')
   if g:twiggy_enable_remote_delete
-    call add(output, 'd^    delete from server')
+    call add(output, 'dP    delete from server')
   endif
+  call add(output, '.     :Git <cursor> <branch>')
   call add(output, '<<    stash')
   call add(output, '>>    pop stash')
   call add(output, '----------------------------')
@@ -630,7 +682,16 @@ function! s:show_branch_details() abort
       let details = details[0:max_len] . '...'
     endif
     redraw
-    echo details
+    " Hacky deprecation code
+    if exists('t:twiggy_deprecation_notice')
+      redraw
+      echohl WarningMsg
+      echomsg t:twiggy_deprecation_notice
+      echohl None
+      unlet t:twiggy_deprecation_notice
+    else
+      echo details
+    endif
   end
 endfunction
 
@@ -651,6 +712,9 @@ function! s:RenderOutputBuffer() abort
 
   setlocal nomodified nomodifiable noswapfile nowrap nonumber
   setlocal buftype=nofile bufhidden=delete
+  if exists('+relativenumber')
+    setlocal norelativenumber
+  endif
   let s:last_output = []
 
   syntax clear
@@ -687,7 +751,7 @@ function! s:PromptToStash() abort
         \ "s:git_cmd('stash', 0)", 1)
 endfunction
 
-"   {{{2 ErrorMsg
+"    {{{2 ErrorMsg
 function! s:ErrorMsg() abort
   if v:warningmsg !=# ''
     redraw
@@ -779,6 +843,9 @@ function! s:Render() abort
     endif
     setlocal filetype=twiggy buftype=nofile bufhidden=delete
     setlocal nonumber nowrap lisp
+    if exists('+relativenumber')
+      setlocal norelativenumber
+    endif
     let t:twiggy_bufnr = bufnr('')
   endif
 
@@ -898,18 +965,25 @@ function! s:Render() abort
   call s:mapping('C',       'Checkout',         [0])
   call s:mapping('o',       'Checkout',         [1])
   call s:mapping('O',       'Checkout',         [0])
+  call s:mapping('gc',      'CheckoutAs',       [])
+  call s:mapping('go',      'CheckoutAs',       [])
   call s:mapping('dd',      'Delete',           [])
-  call s:mapping('F',       'Fetch',            [0])
+  call s:mapping('F',       'Fetch',            [0]) " deprecated
+  call s:mapping('f',       'Fetch',            [0])
   call s:mapping('m',       'Merge',            [0, ''])
   call s:mapping('M',       'Merge',            [1, ''])
   call s:mapping('gm',      'Merge',            [0, '--no-ff'])
   call s:mapping('gM',      'Merge',            [1, '--no-ff'])
   call s:mapping('r',       'Rebase',           [0])
   call s:mapping('R',       'Rebase',           [1])
-  call s:mapping('^',       'Push',             [0, 0])
-  call s:mapping('g^',      'Push',             [1, 0])
-  call s:mapping('!^',      'Push',             [0, 1])
-  call s:mapping('V',       'Pull',             [])
+  call s:mapping('^',       'Push',             [0, 0]) " deprecated
+  call s:mapping('g^',      'Push',             [1, 0]) " deprecated 
+  call s:mapping('!^',      'Push',             [0, 1]) " deprecated
+  call s:mapping('V',       'Pull',             [])     " deprecated
+  call s:mapping('P',       'Push',             [0, 0])
+  call s:mapping('gP',      'Push',             [1, 0])
+  call s:mapping('!P',      'Push',             [0, 1])
+  call s:mapping('p',       'Pull',             [])
   call s:mapping(',',       'Rename',           [])
   call s:mapping('<<',      'Stash',            [0])
   call s:mapping('>>',      'Stash',            [1])
@@ -918,6 +992,13 @@ function! s:Render() abort
   call s:mapping('gi',      'CycleSort',        [1, 1])
   call s:mapping('gI',      'CycleSort',        [1, -1])
   call s:mapping('a',       'ToggleSlashSort',  [])
+
+  nnoremap <buffer> <expr> . <SID>dot()
+  function! s:dot() abort
+    let branch = s:branch_under_cursor()
+
+    return ':Git  '.branch.fullname."\<C-Left>\<Left>"
+  endfunction
 
   if g:twiggy_git_log_command ==# ''
     if exists(':GV')
@@ -930,10 +1011,6 @@ function! s:Render() abort
   if g:twiggy_git_log_command !=# ''
     nnoremap <buffer> gl :exec ':' . g:twiggy_git_log_command . ' ' . <SID>branch_under_cursor().fullname<CR>
     nnoremap <buffer> gL :exec ':' . g:twiggy_git_log_command . ' ' . <SID>branch_under_cursor().fullname . '..'<CR>
-  endif
-
-  if g:twiggy_enable_remote_delete
-    call s:mapping('d^',      'DeleteRemote',     [])
   endif
 
  " {{{ Syntax
@@ -968,14 +1045,15 @@ function! s:Render() abort
   highlight default link TwiggySortText Comment
 
   if exists('s:branches_not_in_reflog') && len(s:branches_not_in_reflog)
+    return
     exec "syntax match TwiggyNotInReflog '" .
           \ s:gsub(s:gsub(join(s:branches_not_in_reflog), '\(', ''), '\)', '') .
           \ "'"
     highlight default link TwiggyNotInReflog Comment
   endif
 
-  exec "syntax match TwiggyDetachedText '\\v%3vHEAD:'"
-  highlight default link TwiggyDetachedText Type
+  exec "syntax match TwiggyDetachedText '\\v%3vHEAD\\@[a-z0-9]+'"
+  highlight default link TwiggyDetachedText Identifier
 
   if s:showing_full_ui()
     syntax match TwiggyHelpHint "\v%1l"
@@ -998,6 +1076,9 @@ function! s:Quickhelp() abort
   silent keepalt edit quickhelp
   setlocal filetype=twiggyqh buftype=nofile bufhidden=delete
   setlocal nonumber nowrap lisp
+  if exists('+relativenumber')
+    setlocal norelativenumber
+  endif
   setlocal modifiable
   silent 1,$delete _
   let b:git_dir = t:twiggy_cached_git_dir
@@ -1014,7 +1095,7 @@ function! s:Quickhelp() abort
   setlocal nomodifiable
 
   syntax clear
-  syntax match TwiggyQuickhelpMapping "\v%<7c[A-Za-z\-\?\^\<\>!,]"
+  syntax match TwiggyQuickhelpMapping "\v%<7c[A-Za-z\-\?\^\<\>!,.]"
   highlight link TwiggyQuickhelpMapping Identifier
   syntax match TwiggyQuickhelpSpecial "\v\`[a-zA-Z]+\`"
   highlight link TwiggyQuickhelpSpecial Identifier
@@ -1153,6 +1234,31 @@ function! s:Checkout(track) abort
   return 0
 endfunction
 
+"     {{{3 Checkout As
+function! s:CheckoutAs() abort
+  let branch = s:branch_under_cursor()
+
+  redraw
+  let new_name = input("Checkout " . branch.name . " as: ", "", "custom,TwiggyCompleteBranches")
+  if new_name !=# ""
+    if new_name ==# branch.name
+      redraw
+      echo branch.name . " already exists."
+      return 1
+    endif
+    call s:git_cmd("checkout -b " . new_name . " " . branch.fullname, 0)
+    redraw
+    echo 'Moving from ' . branch.name . ' to ' . new_name . '...'
+
+    let s:init_line = 0
+    let s:last_branch_under_cursor = 0
+
+    return 0
+  endif
+
+  return 1
+endfunction
+
 "     {{{3 Delete
 function! s:Delete() abort
   let branch = s:branch_under_cursor()
@@ -1192,9 +1298,8 @@ function! s:Fetch(pull) abort
   let cmd = a:pull ? 'pull' : 'fetch'
   let branch = s:branch_under_cursor()
   if branch.tracking !=# ''
-    let parts = split(branch.tracking, '/')
-    call s:git_cmd(cmd . ' ' . parts[0] . ' ' . join(parts[1:], '/') .
-          \ ':refs/remotes/' . parts[0] . '/' . branch.fullname, 1)
+    let remote = split(branch.tracking, '/')[0]
+    call s:git_cmd(cmd . ' ' . remote . ' ' . branch.name, 1)
   else
     redraw
     echo branch.name . ' is not a tracking branch'
@@ -1254,12 +1359,12 @@ function! s:Rebase(remote) abort
   return 0
 endfunction
 
-"     {{{3 Continue Rebase 
+"     {{{3 Continue Rebase
 function! s:Continue(type) abort
   call s:git_cmd(a:type . ' --continue', 1)
 endfunction
 
-"     {{{3 Skip Rebase 
+"     {{{3 Skip Rebase
 function! s:Skip() abort
   call s:git_cmd('rebase --skip', 1)
 endfunction

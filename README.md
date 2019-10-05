@@ -46,15 +46,15 @@ settings will be remembered until you close Vim.
 
 With your cursor on a branch, `m` merges it into the current branch.  With your
 cursor on a local branch, `M` will merge its tracked remote into the current
-branch.  Use `r` and `R` for rebasing.  `F` fetches the branch under the cursor.
+branch.  Use `r` and `R` for rebasing.  `f` fetches the branch under the cursor.
 
 `u` aborts a merge or rebase.
 
 ### And finally...
 
-`^` to push (also sets the upstream).
+`P` to push (also sets the upstream).
 
-`V` to pull.
+`p` to pull.
 
 `dd` to delete a branch.  You will be prompted if it's unmerged.
 
